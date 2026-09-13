@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import threading
@@ -13,7 +14,7 @@ from pydantic import JsonValue, ValidationError
 
 from ida_re_mcp.application import Application
 from ida_re_mcp.config import AppConfig, PolicyConfig, RuntimePaths, StorageConfig, WorkerConfig
-from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES
+from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES, RESOURCE_CHUNK_BYTES
 from ida_re_mcp.domain.address import DatabaseAddress
 from ida_re_mcp.domain.base import JsonObject, StrictModel
 from ida_re_mcp.domain.errors import BusinessErrorCode, ToolExecutionError
@@ -56,7 +57,13 @@ from ida_re_mcp.supervisor._process_lock import (
     AsyncInterprocessFileLock,
     AsyncInterprocessSlotLease,
 )
-from ida_re_mcp.supervisor.artifacts import ArtifactNotFoundError, parse_artifact_uri
+from ida_re_mcp.supervisor.artifacts import (
+    ArtifactChunk,
+    ArtifactMetadata,
+    ArtifactNotFoundError,
+    ArtifactStore,
+    parse_artifact_uri,
+)
 from ida_re_mcp.supervisor.backend import AnalysisBackend, DebugBackend
 from ida_re_mcp.supervisor.changes import ChangeSetStore
 from ida_re_mcp.supervisor.cursors import CursorCodec
@@ -1338,6 +1345,84 @@ def test_text_resource_decode_failure_remains_an_internal_failure(tmp_path: Path
         with pytest.raises(UnicodeDecodeError):
             await application.read_resource(artifact.uri)
         await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_resource_read_finishes_before_other_store_collects_its_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, _backend = _application(tmp_path)
+        store = application.storage.artifacts
+        collector = ArtifactStore(
+            store.root,
+            workspace_lease_root=application.storage.workspaces.lease_root,
+        )
+        data = b"r" * (RESOURCE_CHUNK_BYTES + 31)
+        artifact = store.put_bytes(
+            workspace_id=workspace.workspace_id,
+            revision="rev_retired",
+            data=data,
+            media_type="application/octet-stream",
+        )
+        reading_second_chunk = threading.Event()
+        continue_read = threading.Event()
+        gc_started = threading.Event()
+        original_read = store.read_verified_chunk
+
+        def delayed_read(
+            metadata: ArtifactMetadata,
+            *,
+            offset: int = 0,
+            limit: int = RESOURCE_CHUNK_BYTES,
+        ) -> ArtifactChunk:
+            if offset:
+                reading_second_chunk.set()
+                assert continue_read.wait(timeout=5)
+            return original_read(metadata, offset=offset, limit=limit)
+
+        def retained_revisions(_workspace_id: str) -> set[str]:
+            gc_started.set()
+            return set()
+
+        monkeypatch.setattr(store, "read_verified_chunk", delayed_read)
+        reading = asyncio.create_task(application.read_resource(artifact.uri))
+        collecting = None
+        try:
+            assert await asyncio.to_thread(reading_second_chunk.wait, 1)
+            collecting = asyncio.create_task(
+                asyncio.to_thread(
+                    collector.collect_garbage,
+                    retained_scopes=set(),
+                    retained_revision_provider=retained_revisions,
+                    dry_run=False,
+                )
+            )
+            assert await asyncio.to_thread(gc_started.wait, 1)
+            await asyncio.sleep(0.05)
+            assert not collecting.done()
+        finally:
+            continue_read.set()
+            await asyncio.gather(
+                reading,
+                *([collecting] if collecting is not None else []),
+                return_exceptions=True,
+            )
+            await application.aclose()
+
+        resource = reading.result()
+        assert (
+            b"".join(
+                base64.b64decode(part.blob) for part in resource.contents if part.kind == "blob"
+            )
+            == data
+        )
+        assert collecting is not None
+        assert collecting.result().removed_paths == (
+            store.root / workspace.workspace_id / "rev_retired",
+        )
 
     asyncio.run(scenario())
 

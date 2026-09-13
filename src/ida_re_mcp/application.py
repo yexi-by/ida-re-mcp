@@ -642,8 +642,6 @@ class Application:
         self,
         uri: str,
     ) -> ResourceRead:
-        contents: list[ResourceData] = []
-        offset = 0
         try:
             workspace_id, revision, artifact_id = parse_artifact_uri(uri)
         except ValueError as exc:
@@ -651,58 +649,63 @@ class Application:
                 "文件地址格式不正确。请使用工具返回的完整文件地址。",
                 uri=uri,
             ) from exc
-        try:
-            metadata = await asyncio.to_thread(
-                self.storage.artifacts.get,
-                workspace_id,
-                revision,
-                artifact_id,
-                verify=True,
-            )
-            text_decoder = (
-                codecs.getincrementaldecoder("utf-8")(errors="strict")
-                if _is_utf8_resource(metadata.media_type)
-                else None
-            )
-            while len(contents) < _MAX_RESOURCE_CONTENTS:
-                chunk = await asyncio.to_thread(
-                    self.storage.artifacts.read_verified_chunk,
-                    metadata,
-                    offset=offset,
-                    limit=(
-                        RESOURCE_CHUNK_BYTES - 4
-                        if text_decoder is not None
-                        else RESOURCE_CHUNK_BYTES
-                    ),
+
+        def read_contents() -> ResourceRead:
+            contents: list[ResourceData] = []
+            offset = 0
+            with self.storage.artifacts.resource_read_lock(workspace_id):
+                try:
+                    metadata = self.storage.artifacts.get(
+                        workspace_id,
+                        revision,
+                        artifact_id,
+                        verify=True,
+                    )
+                    text_decoder = (
+                        codecs.getincrementaldecoder("utf-8")(errors="strict")
+                        if _is_utf8_resource(metadata.media_type)
+                        else None
+                    )
+                    while len(contents) < _MAX_RESOURCE_CONTENTS:
+                        chunk = self.storage.artifacts.read_verified_chunk(
+                            metadata,
+                            offset=offset,
+                            limit=(
+                                RESOURCE_CHUNK_BYTES - 4
+                                if text_decoder is not None
+                                else RESOURCE_CHUNK_BYTES
+                            ),
+                        )
+                        if text_decoder is None:
+                            contents.append(
+                                BinaryResourceData(
+                                    kind="blob",
+                                    uri=uri,
+                                    mime_type=chunk.metadata.media_type,
+                                    blob=base64.b64encode(chunk.data).decode("ascii"),
+                                )
+                            )
+                        else:
+                            contents.append(
+                                TextResourceData(
+                                    kind="text",
+                                    uri=uri,
+                                    mime_type=chunk.metadata.media_type,
+                                    text=text_decoder.decode(chunk.data, final=chunk.eof),
+                                )
+                            )
+                        if chunk.eof:
+                            return ResourceRead(contents=contents)
+                        assert chunk.next_offset is not None
+                        offset = chunk.next_offset
+                except ArtifactNotFoundError as exc:
+                    raise ResourceNotFoundError(uri=uri) from exc
+                raise RuntimeError(
+                    "生成文件过大，无法一次读完。"
+                    "请使用生成该文件的工具返回的文件索引，并按索引中的分块地址读取。"
                 )
-                if text_decoder is None:
-                    contents.append(
-                        BinaryResourceData(
-                            kind="blob",
-                            uri=uri,
-                            mime_type=chunk.metadata.media_type,
-                            blob=base64.b64encode(chunk.data).decode("ascii"),
-                        )
-                    )
-                else:
-                    contents.append(
-                        TextResourceData(
-                            kind="text",
-                            uri=uri,
-                            mime_type=chunk.metadata.media_type,
-                            text=text_decoder.decode(chunk.data, final=chunk.eof),
-                        )
-                    )
-                if chunk.eof:
-                    return ResourceRead(contents=contents)
-                assert chunk.next_offset is not None
-                offset = chunk.next_offset
-        except ArtifactNotFoundError as exc:
-            raise ResourceNotFoundError(uri=uri) from exc
-        raise RuntimeError(
-            "生成文件过大，无法一次读完。"
-            "请使用生成该文件的工具返回的文件索引，并按索引中的分块地址读取。"
-        )
+
+        return await asyncio.to_thread(read_contents)
 
     async def doctor(self) -> tuple[bool, JsonObject]:
         self._require_open()

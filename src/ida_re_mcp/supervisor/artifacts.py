@@ -32,7 +32,7 @@ from ida_re_mcp.supervisor._fs import (
     validate_identifier,
     validate_sha256,
 )
-from ida_re_mcp.supervisor._process_lock import interprocess_file_lock
+from ida_re_mcp.supervisor._process_lock import InterprocessFileLock, interprocess_file_lock
 from ida_re_mcp.supervisor.errors import ArtifactIntegrityError, ArtifactNotFoundError
 
 _BLOB_NAME = "artifact.blob"
@@ -140,6 +140,12 @@ class ArtifactStore:
         self._gc_lease_root = self.root / ".gc-locks"
         self._gc_lease_root.mkdir(exist_ok=True)
         self._lock = threading.RLock()
+
+    def resource_read_lock(self, workspace_id: str) -> InterprocessFileLock:
+        """返回与 GC 共享的进程锁；完整读取生成文件期间须在同一线程持有。"""
+
+        validate_identifier(workspace_id, field="workspace_id")
+        return interprocess_file_lock(self._gc_lease_root / f"{workspace_id}.lease.lock")
 
     def put_bytes(
         self,
@@ -490,7 +496,7 @@ class ArtifactStore:
             if len(relative.parts) != 3:
                 continue
             workspace_id, revision, artifact_id = relative.parts
-            gc_lease = interprocess_file_lock(self._gc_lease_root / f"{workspace_id}.lease.lock")
+            gc_lease = self.resource_read_lock(workspace_id)
             gc_lease.acquire()
             try:
                 with self._lock:
@@ -577,9 +583,7 @@ class ArtifactStore:
                         )
                         for revision in retained_revision_provider(workspace_id)
                     }
-                gc_lease = interprocess_file_lock(
-                    self._gc_lease_root / f"{workspace_id}.lease.lock"
-                )
+                gc_lease = self.resource_read_lock(workspace_id)
                 with gc_lease, self._lock:
                     if not workspace_root.exists():
                         continue
