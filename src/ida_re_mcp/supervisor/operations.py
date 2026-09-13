@@ -310,7 +310,8 @@ class OperationCoordinator:
         *,
         terminal: bool = False,
     ) -> None:
-        now = self._clock()
+        # 系统时钟可能因校时回拨；同一记录的时间仍须符合持久化读取约束。
+        now = max(self._clock(), entry.updated_at)
         previous = (entry.state, entry.updated_at, entry.finished_at)
         entry.state = state
         entry.updated_at = now
@@ -393,8 +394,8 @@ class OperationCoordinator:
                 entry.state = (
                     OperationState.SUCCEEDED if recovered is not None else OperationState.FAILED
                 )
-                entry.updated_at = now
-                entry.finished_at = now
+                entry.updated_at = max(now, entry.updated_at)
+                entry.finished_at = entry.updated_at
                 entry.result = _copy_json(recovered.result) if recovered is not None else None
                 entry.failure = (
                     None

@@ -163,6 +163,41 @@ def test_terminal_operation_survives_coordinator_restart(tmp_path: Path) -> None
     assert latest.operation_id == operation.operation_id
 
 
+def test_clock_rollback_keeps_terminal_record_readable(tmp_path: Path) -> None:
+    root = tmp_path / "operations"
+    clock = ManualClock()
+    coordinator = OperationCoordinator(storage_root=root, clock=clock)
+    operation = coordinator.create("workspace.export")
+    clock.value += 10
+    running = coordinator.start(operation.operation_id)
+    clock.value -= 20
+    completed = coordinator.succeed(operation.operation_id, {"revision": "rev_ready"})
+
+    restored = OperationCoordinator(storage_root=root, clock=clock).get(operation.operation_id)
+
+    assert restored == completed
+    assert restored.updated_at >= running.updated_at
+    assert restored.finished_at == restored.updated_at
+
+
+def test_clock_rollback_during_recovery_keeps_record_readable(tmp_path: Path) -> None:
+    root = tmp_path / "operations"
+    clock = ManualClock()
+    coordinator = OperationCoordinator(storage_root=root, clock=clock)
+    operation = coordinator.create("analysis.refine")
+    clock.value += 10
+    running = coordinator.start(operation.operation_id)
+    clock.value -= 20
+
+    recovered = OperationCoordinator(storage_root=root, clock=clock).get(operation.operation_id)
+    reopened = OperationCoordinator(storage_root=root, clock=clock).get(operation.operation_id)
+
+    assert recovered.state is OperationState.FAILED
+    assert reopened == recovered
+    assert reopened.updated_at >= running.updated_at
+    assert reopened.finished_at == reopened.updated_at
+
+
 @pytest.mark.parametrize(
     "state",
     [
