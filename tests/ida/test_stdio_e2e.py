@@ -472,7 +472,25 @@ def test_real_stdio_static_and_transaction_chain(
                             "kind": "rename",
                             "target": target,
                             "new_name": "agent_verified_entry",
-                        }
+                        },
+                        {
+                            "kind": "set_type",
+                            "target": target,
+                            "type_ref": {
+                                "kind": "function",
+                                "return_type": {"kind": "primitive", "name": "i32"},
+                                "parameters": [
+                                    {
+                                        "name": "input",
+                                        "type": {
+                                            "kind": "pointer",
+                                            "to": {"kind": "primitive", "name": "i8"},
+                                        },
+                                    },
+                                    {"name": "size", "type": {"kind": "primitive", "name": "u32"}},
+                                ],
+                            },
+                        },
                     ],
                 },
             )
@@ -488,6 +506,18 @@ def test_real_stdio_static_and_transaction_chain(
             )
             next_revision = cast(str, applied["revision"])
             assert next_revision != revision
+
+            inspected_type = await _call_tool(
+                client,
+                name="type.inspect",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": next_revision,
+                    "type": {"kind": "address", "address": target},
+                },
+            )
+            assert inspected_type["kind"] == "function"
+            assert inspected_type["size"] is None
 
             verified = await _call_tool(
                 client,

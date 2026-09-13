@@ -206,7 +206,7 @@ def test_closed_operations_map_losslessly_to_worker_json() -> None:
     }
     assert execution.worker_operations[1]["repeatable"] is True
     assert execution.worker_operations[2]["declaration"] == (
-        "__int32 __fastcall __ida_re_value(const Game::Actor *actor)"
+        "__int32 __fastcall __ida_re_value(const Game::Actor *actor);"
     )
     assert execution.worker_operations[3]["bytes_hex"] == "9090"
     assert plan.preimage.component_hashes["database.i64.id0"] == "33" * 32

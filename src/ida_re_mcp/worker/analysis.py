@@ -2384,10 +2384,11 @@ class AnalysisWorker(OwnerThreadBound):
         text_reasons: list[str] = []
         if len(declaration) > _INLINE_TYPE_TEXT_LIMIT:
             text_reasons.append("type_declaration_text_hard_limit_reached")
+        size = int(type_info.get_size())
         details: dict[str, object] = {
             **identity,
             "declaration": declaration[:_INLINE_TYPE_TEXT_LIMIT],
-            "size": int(type_info.get_size()),
+            "size": -1 if size == int(api.ida_typeinf.BADSIZE) else size,
             "is_pointer": bool(type_info.is_ptr()),
             "is_function": bool(type_info.is_func()),
             "is_struct": bool(type_info.is_struct()),

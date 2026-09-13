@@ -892,7 +892,7 @@ def _verify_validated_source(source: ValidatedIl2CppSource) -> None:
 
 
 def _type_declaration(type_ref: CanonicalTypeRef, revision: str) -> str:
-    declaration = _render_type(type_ref, "__ida_re_value", revision)
+    declaration = _render_type(type_ref, "__ida_re_value", revision) + ";"
     if len(declaration.encode("utf-8")) > 16_384:
         raise ChangeAdapterInputError("set_type 展开后的声明超过 16 KiB")
     return declaration
