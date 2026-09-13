@@ -304,7 +304,7 @@ class ProgramOverviewInput(StaticQuery):
         default_factory=list,
         max_length=8,
         description=(
-            "要附带的内容；留空时只返回文件信息和数量。"
+            "要附带的内容；留空时附带全部可选内容。"
             "可选段、入口点、导入、导出、重定位、异常处理、函数和字符串。"
         ),
     )
