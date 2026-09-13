@@ -1414,7 +1414,15 @@ class Application:
             self._workspace_lock(typed_arguments.workspace_id),
             self._analysis_slots,
         ):
-            return await self._static_query_unlocked(name, typed_arguments)
+            output = await self._static_query_unlocked(name, typed_arguments)
+            if _inline_model_size(output) <= MAX_INLINE_RESULT_BYTES:
+                return output
+            return await self._store_static_artifact(
+                name,
+                typed_arguments.workspace_id,
+                typed_arguments.revision,
+                output,
+            )
 
     async def _static_query_unlocked(
         self,
@@ -1518,14 +1526,7 @@ class Application:
                     )
                 )
                 output = output.model_copy(update={"next_cursor": next_cursor})
-            if _inline_model_size(output) <= MAX_INLINE_RESULT_BYTES:
-                return output
-            return await self._store_static_artifact(
-                name,
-                workspace_id,
-                revision,
-                output,
-            )
+            return output
         except (WorkerProcessError, asyncio.CancelledError):
             reusable = False
             discard = asyncio.create_task(self._discard_analysis_session(session))
@@ -1982,26 +1983,6 @@ class Application:
         if _inline_model_size(compact) > MAX_INLINE_RESULT_BYTES:
             raise RuntimeError(f"{name} 的 artifact 引用输出仍超过 inline 上限")
         return compact
-
-    async def _static_query_by_ids_unlocked(
-        self,
-        name: str,
-        workspace_id: str,
-        revision: str,
-        extra: Mapping[str, JsonValue],
-    ) -> StrictModel:
-        spec = self._catalog_by_name[name]
-        arguments = spec.input_model.model_validate(
-            {
-                "workspace_id": workspace_id,
-                "revision": revision,
-                **extra,
-            }
-        )
-        return await self._static_query_unlocked(
-            name,
-            cast(StaticAdapterInput, arguments),
-        )
 
     async def _report_build(
         self,
@@ -3396,7 +3377,7 @@ class Application:
             return await self._build_report_unlocked(arguments)
 
     async def _build_report_unlocked(self, arguments: ReportBuildInput) -> JsonObject:
-        include: list[JsonValue] = []
+        include: list[Literal["entry_points", "imports", "exports"]] = []
         if "entry_points" in arguments.sections:
             include.append("entry_points")
         if "imports_exports" in arguments.sections:
@@ -3404,39 +3385,14 @@ class Application:
         async with self._analysis_slots:
             overview = cast(
                 ProgramOverviewOutput,
-                await self._static_query_by_ids_unlocked(
+                await self._static_query_unlocked(
                     "program.overview",
-                    arguments.workspace_id,
-                    arguments.revision,
-                    {"include": include},
+                    ProgramOverviewInput(
+                        workspace_id=arguments.workspace_id,
+                        revision=arguments.revision,
+                        include=[*include],
+                    ),
                 ),
-            )
-        if overview.result_artifact is not None:
-            artifact_ref = overview.result_artifact
-            artifact_workspace, artifact_revision, artifact_id = parse_artifact_uri(
-                artifact_ref.uri
-            )
-            metadata = await asyncio.to_thread(
-                self.storage.artifacts.get,
-                artifact_workspace,
-                artifact_revision,
-                artifact_id,
-            )
-            if (
-                artifact_workspace != arguments.workspace_id
-                or artifact_revision != arguments.revision
-                or metadata.content_sha256 != artifact_ref.sha256
-                or metadata.size != artifact_ref.size
-            ):
-                raise RuntimeError("report.build 的静态 artifact 身份不一致")
-            overview = ProgramOverviewOutput.model_validate_json(
-                await asyncio.to_thread(
-                    self.storage.artifacts.read_all,
-                    artifact_workspace,
-                    artifact_revision,
-                    artifact_id,
-                ),
-                strict=True,
             )
         document: dict[str, object] = {
             "title": arguments.title or "逆向分析报告",

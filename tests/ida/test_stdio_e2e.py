@@ -16,6 +16,7 @@ from typing import Literal, cast
 import pytest
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+from pydantic import AnyUrl
 
 from ida_re_mcp.il2cpp import canonical_ndjson, compute_record_id
 from ida_re_mcp.il2cpp.canonical import JsonObject as CanonicalJsonObject
@@ -444,6 +445,53 @@ def test_real_stdio_static_and_transaction_chain(
             assert image["architecture"] == architecture
             assert image["bitness"] == bitness
             expected_image_size = cast(int, image["image_size"])
+
+            report_result = await client.call_tool(
+                "report.build",
+                {
+                    "workspace_id": workspace_id,
+                    "revision": revision,
+                    "format": "json",
+                    "sections": ["overview", "entry_points", "imports_exports"],
+                },
+            )
+            assert report_result.isError is False
+            report = report_result.structuredContent
+            assert report is not None
+            assert report == {
+                "operation_id": report["operation_id"],
+                "workspace_id": workspace_id,
+                "revision": revision,
+            }
+            assert len(report_result.content) == 1
+            report_summary = report_result.content[0]
+            assert isinstance(report_summary, types.TextContent)
+            assert "生成报告" in report_summary.text
+            assert "operation.wait" in report_summary.text
+            report_output = await _wait_operation(client, operation_id=report["operation_id"])
+            resource = await client.read_resource(AnyUrl(cast(str, report_output["artifact_uri"])))
+            assert all(isinstance(item, types.TextResourceContents) for item in resource.contents)
+            report_bytes = "".join(
+                item.text
+                for item in resource.contents
+                if isinstance(item, types.TextResourceContents)
+            ).encode("utf-8")
+            assert len(report_bytes) == report_output["size"]
+            assert hashlib.sha256(report_bytes).hexdigest() == report_output["sha256"]
+            document = json.loads(report_bytes)
+            assert document["workspace_id"] == workspace_id
+            assert document["revision"] == revision
+            assert document["overview"]["image"] == image
+            assert set(document) == {
+                "title",
+                "workspace_id",
+                "revision",
+                "sections",
+                "overview",
+                "entry_points",
+                "imports",
+                "exports",
+            }
 
             searched = await _call_tool(
                 client,

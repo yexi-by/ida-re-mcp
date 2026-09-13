@@ -39,6 +39,8 @@ from ida_re_mcp.domain.tools import (
     ProgramSearchInput,
     ProgramSearchOutput,
     RenameOperation,
+    ReportBuildInput,
+    ReportBuildOutput,
     WorkspaceAnalysisOutcome,
     WorkspaceCreateInput,
     WorkspaceCreateOutput,
@@ -1104,6 +1106,81 @@ def test_oversized_unpaged_overview_preserves_full_requested_result_in_artifact(
         assert full_result.counts.functions == 100
         assert full_result.coverage.status == "complete"
         await application.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("report_format", ["json", "markdown"])
+def test_report_build_accepts_overview_larger_than_resource_chunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report_format: str,
+) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, backend = _application(tmp_path)
+        assert workspace.current_revision is not None
+        original_execute = backend.execute_analysis
+
+        async def large_overview(
+            *,
+            checkout_path: Path,
+            revision: str,
+            operation: str,
+            input: Mapping[str, JsonValue],
+            timeout_seconds: float,
+        ) -> JsonObject:
+            raw = await original_execute(
+                checkout_path=checkout_path,
+                revision=revision,
+                operation=operation,
+                input=input,
+                timeout_seconds=timeout_seconds,
+            )
+            raw["strings"] = [
+                {"address": f"0x{0x140002000 + index:x}", "value": "界" * 2048, "length": 6144}
+                for index in range(200)
+            ]
+            counts = raw["counts"]
+            assert isinstance(counts, dict)
+            counts["strings"] = 200
+            assert len(json.dumps(raw, ensure_ascii=False).encode("utf-8")) > RESOURCE_CHUNK_BYTES
+            return raw
+
+        monkeypatch.setattr(backend, "execute_analysis", large_overview)
+        try:
+            queued = await application.execute_tool(
+                "report.build",
+                ReportBuildInput.model_validate(
+                    {
+                        "workspace_id": workspace.workspace_id,
+                        "revision": workspace.current_revision,
+                        "format": report_format,
+                        "sections": ["overview"],
+                    }
+                ),
+            )
+            assert isinstance(queued, ReportBuildOutput)
+            completed = await application.execute_tool(
+                "operation.wait",
+                OperationWaitInput(operation_id=queued.operation_id, wait_ms=30_000),
+            )
+            assert isinstance(completed, OperationWaitOutput)
+            assert completed.state == "succeeded", completed
+            assert isinstance(completed.result, dict)
+            uri = completed.result["artifact_uri"]
+            assert isinstance(uri, str)
+            payload = application.storage.artifacts.read_all(*parse_artifact_uri(uri))
+            assert hashlib.sha256(payload).hexdigest() == completed.result["sha256"]
+            assert len(payload) == completed.result["size"]
+            if report_format == "json":
+                document = json.loads(payload)
+                assert document["overview"]["counts"]["strings"] == 200
+                assert document["overview"]["image"]["sha256"] == workspace.sample_sha256
+            else:
+                assert "字符串数量：`200`" in payload.decode("utf-8")
+                assert workspace.sample_sha256 in payload.decode("utf-8")
+        finally:
+            await application.aclose()
 
     asyncio.run(scenario())
 
