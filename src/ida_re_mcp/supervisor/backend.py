@@ -172,20 +172,18 @@ class _ProcessDebugBackend:
         try:
             return await asyncio.shield(execution)
         except asyncio.CancelledError as cancellation:
-            try:
-                await asyncio.to_thread(self._process.cancel, request_id)
-            except Exception:
-                # IPC 失联由原调用报告；取消调试时不能因此结束目标进程。
-                pass
-            while not execution.done():
+            settlement = asyncio.create_task(
+                _cancel_debug_and_wait(self._process, request_id, execution)
+            )
+            while not settlement.done():
                 try:
-                    await asyncio.shield(execution)
+                    await asyncio.shield(settlement)
                 except asyncio.CancelledError:
                     continue
                 except Exception:
                     break
             try:
-                result = execution.result()
+                result = settlement.result()
             except BaseException as failure:
                 raise DebugRequestCancelled(operation, None, failure) from cancellation
             raise DebugRequestCancelled(operation, result) from cancellation
@@ -580,6 +578,21 @@ async def _abort_worker_and_wait(
         await asyncio.to_thread(process.abort)
     finally:
         await asyncio.gather(execution, return_exceptions=True)
+
+
+async def _cancel_debug_and_wait(
+    process: WorkerProcess,
+    request_id: str,
+    execution: asyncio.Task[JsonObject],
+) -> JsonObject:
+    """转发取消并取得真实结果，整个过程由调用方屏蔽重复取消。"""
+
+    try:
+        await asyncio.to_thread(process.cancel, request_id)
+    except Exception:
+        # IPC 失联由原调用报告；取消调试时不能因此结束目标进程。
+        pass
+    return await execution
 
 
 async def _await_cleanup(cleanup: asyncio.Task[None]) -> None:

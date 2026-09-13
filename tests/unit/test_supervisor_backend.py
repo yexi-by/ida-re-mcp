@@ -229,6 +229,61 @@ def test_analysis_cancellation_aborts_persistent_worker_process(
     asyncio.run(scenario())
 
 
+def test_debug_repeated_cancellation_waits_for_forwarding_and_real_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        cancel_started = threading.Event()
+        release_cancel = threading.Event()
+
+        class DelayedCancellationWorker(_BlockingWorker):
+            def cancel(self, request_id: str) -> None:
+                cancel_started.set()
+                assert release_cancel.wait(3)
+                super().cancel(request_id)
+
+        worker = DelayedCancellationWorker(
+            debug_result={
+                "state": "suspended",
+                "stop_id": "stop_after_cancellation",
+                "latest_sequence": 7,
+                "cancelled": True,
+            }
+        )
+        _replace_launch(monkeypatch, worker)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+        debug = await backend.open_debug(
+            checkout_path=tmp_path / "checkout.i64",
+            sample_path=tmp_path / "sample.exe",
+            revision="revision_123",
+            allow_attach=False,
+        )
+        execution = asyncio.create_task(
+            debug.execute("debug.control", {"action": "pause"}, timeout_seconds=5)
+        )
+        try:
+            assert await asyncio.to_thread(worker.started.wait, 1)
+            execution.cancel()
+            assert await asyncio.to_thread(cancel_started.wait, 1)
+            execution.cancel()
+            await asyncio.sleep(0)
+            assert not execution.done()
+
+            release_cancel.set()
+            with pytest.raises(DebugRequestCancelled) as cancelled:
+                await execution
+            assert cancelled.value.result == worker.debug_result
+            assert worker.cancelled_request_id == worker.request_id
+            assert not worker.aborted
+        finally:
+            release_cancel.set()
+            await asyncio.gather(execution, return_exceptions=True)
+            await debug.close()
+
+    asyncio.run(scenario())
+
+
 def test_analysis_repeated_cancellation_waits_for_abort_to_finish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
