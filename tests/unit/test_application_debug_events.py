@@ -14,6 +14,7 @@ from ida_re_mcp.config import AppConfig, RuntimePaths
 from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES
 from ida_re_mcp.domain.address import ImageAddress
 from ida_re_mcp.domain.base import JsonObject
+from ida_re_mcp.domain.errors import BusinessErrorCode, ToolExecutionError
 from ida_re_mcp.domain.tools import (
     BreakpointSpec,
     DebugBreakpointsInput,
@@ -238,6 +239,261 @@ def _paths(tmp_path: Path) -> RuntimePaths:
         checkout_root=root / "checkouts",
         temp_root=root / "temp",
     )
+
+
+async def _open_debug_application(
+    tmp_path: Path,
+    debug_backend: _FakeDebugBackend,
+    *,
+    idle_seconds: int = 300,
+) -> tuple[Application, str]:
+    config = AppConfig.model_validate({"workers": {"idle_seconds": idle_seconds}})
+    paths = _paths(tmp_path)
+    storage = SupervisorStorage.open(config=config, paths=paths)
+    source = tmp_path / "debug_target_x64.exe"
+    source.write_bytes(b"MZ" + b"\0" * 510)
+    workspace = storage.workspaces.create(source)
+    staging = storage.workspaces.begin_staging(workspace.workspace_id, expected_revision=None)
+    staging.database_path.write_bytes(b"cold-debug-idb")
+    receipt = ColdValidationReceipt.create(
+        validator="fake_ida_9_3_headless",
+        component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
+    )
+    revision = storage.workspaces.publish_staging(staging, receipt=receipt)
+    backend = _FakeIdaBackend()
+    backend.debug = debug_backend
+    application = Application(
+        config=config,
+        storage=storage,
+        changes=ChangeSetStore(paths.data_root / "change-sets"),
+        cursors=CursorCodec(paths.data_root / "cursor.key"),
+        backend=backend,
+    )
+    try:
+        await application.execute_tool(
+            "debug.establish",
+            DebugEstablishInput(
+                workspace_id=workspace.workspace_id,
+                revision=revision.revision,
+                target=DebugLaunchTarget(kind="launch", stop_on_entry=True),
+            ),
+        )
+    except BaseException:
+        await application.aclose()
+        raise
+    return application, f"image~{workspace.sample_sha256}"
+
+
+class _QueuedDebugBackend(_FakeDebugBackend):
+    """和真实 WorkerProcess 一样，只为单条 worker 命令提供互斥。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.command_lock = asyncio.Lock()
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.second_started = asyncio.Event()
+        self.release_second = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.calls: list[tuple[str, str]] = []
+        self.breakpoints: dict[str, JsonObject] = {}
+        self.next_breakpoint = 0
+
+    async def execute(
+        self,
+        operation: str,
+        input: Mapping[str, JsonValue],
+        *,
+        timeout_seconds: float,
+    ) -> JsonObject:
+        async with self.command_lock:
+            task = asyncio.current_task()
+            assert task is not None
+            name = task.get_name()
+            action = input.get("action")
+            if operation == "debug.breakpoints":
+                assert isinstance(action, str)
+                self.calls.append((name, action))
+                if len(self.calls) == 1:
+                    self.first_started.set()
+                    await self.release_first.wait()
+                if action == "list":
+                    return self.session_payload(breakpoints=list(self.breakpoints.values()))
+                if action == "add":
+                    location = input.get("location")
+                    assert isinstance(location, dict)
+                    module = location.get("module")
+                    rva = location.get("rva")
+                    assert isinstance(module, str) and isinstance(rva, str)
+                    self.next_breakpoint += 1
+                    identifier = f"breakpoint_{self.next_breakpoint}"
+                    value: JsonObject = {
+                        "breakpoint_id": identifier,
+                        "module": module,
+                        "rva": rva,
+                        "enabled": True,
+                        "active": True,
+                        "runtime_address": f"0x{0x140000000 + int(rva, 16):x}",
+                    }
+                    self.breakpoints[identifier] = value
+                    return self.session_payload(breakpoint=value)
+                if action == "remove":
+                    identifier = input.get("breakpoint_id")
+                    assert isinstance(identifier, str)
+                    del self.breakpoints[identifier]
+                    return self.session_payload(removed=identifier)
+                raise AssertionError(action)
+            if operation == "debug.events" and name in {"first-events", "second-events"}:
+                started, released = (
+                    (self.first_started, self.release_first)
+                    if name == "first-events"
+                    else (self.second_started, self.release_second)
+                )
+                started.set()
+                await released.wait()
+            return await super().execute(operation, input, timeout_seconds=timeout_seconds)
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await super().close()
+
+
+def test_debug_breakpoint_replacements_are_serialized_as_complete_tools(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _QueuedDebugBackend()
+        application, image_id = await _open_debug_application(tmp_path, backend)
+        tasks: list[asyncio.Task[object]] = []
+        try:
+            for index, name in enumerate(("first", "second"), start=1):
+                tasks.append(
+                    asyncio.create_task(
+                        application.execute_tool(
+                            "debug.breakpoints",
+                            DebugBreakpointsInput(
+                                debug_session_id=_SESSION_ID,
+                                stop_id=_STOP_ID,
+                                replace=[
+                                    BreakpointSpec(
+                                        address=ImageAddress(
+                                            kind="image",
+                                            image_id=image_id,
+                                            rva=f"0x{index * 0x1000:x}",
+                                        ),
+                                    )
+                                ],
+                            ),
+                        ),
+                        name=name,
+                    )
+                )
+                if index == 1:
+                    await asyncio.wait_for(backend.first_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            backend.release_first.set()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            assert all(isinstance(result, DebugBreakpointsOutput) for result in results)
+            assert backend.calls == [
+                ("first", "list"),
+                ("first", "add"),
+                ("first", "list"),
+                ("second", "list"),
+                ("second", "remove"),
+                ("second", "add"),
+                ("second", "list"),
+            ]
+        finally:
+            backend.release_first.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_queued_debug_request_cancels_idle_timer_when_it_starts(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _QueuedDebugBackend()
+        application, _image_id = await _open_debug_application(tmp_path, backend, idle_seconds=1)
+        tasks: list[asyncio.Task[object]] = []
+        try:
+            for name in ("first-events", "second-events"):
+                tasks.append(
+                    asyncio.create_task(
+                        application.execute_tool(
+                            "debug.events",
+                            DebugEventsInput(
+                                debug_session_id=_SESSION_ID,
+                                after_sequence=206,
+                            ),
+                        ),
+                        name=name,
+                    )
+                )
+                if name == "first-events":
+                    await asyncio.wait_for(backend.first_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            backend.release_first.set()
+            await asyncio.wait_for(backend.second_started.wait(), timeout=1)
+            await tasks[0]
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(backend.close_started.wait(), timeout=1.1)
+            assert not tasks[1].done()
+            backend.release_second.set()
+            assert isinstance(await tasks[1], DebugEventsOutput)
+        finally:
+            backend.release_first.set()
+            backend.release_second.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await application.aclose()
+        assert backend.close_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_debug_close_waits_for_active_tool_and_rejects_queued_tool(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        backend = _QueuedDebugBackend()
+        application, _image_id = await _open_debug_application(tmp_path, backend)
+        tasks: list[asyncio.Task[object]] = []
+        closing: asyncio.Task[None] | None = None
+        try:
+            for name in ("first-events", "second-events"):
+                tasks.append(
+                    asyncio.create_task(
+                        application.execute_tool(
+                            "debug.events",
+                            DebugEventsInput(
+                                debug_session_id=_SESSION_ID,
+                                after_sequence=206,
+                            ),
+                        ),
+                        name=name,
+                    )
+                )
+                if name == "first-events":
+                    await asyncio.wait_for(backend.first_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            closing = asyncio.create_task(application.aclose())
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(backend.close_started.wait(), timeout=0.05)
+            assert not closing.done()
+            backend.release_first.set()
+            assert isinstance(await tasks[0], DebugEventsOutput)
+            with pytest.raises(ToolExecutionError) as rejected:
+                await tasks[1]
+            assert rejected.value.code == BusinessErrorCode.DEBUG_STATE_CONFLICT
+            assert not backend.second_started.is_set()
+            await closing
+        finally:
+            backend.release_first.set()
+            backend.release_second.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if closing is not None:
+                await closing
+            await application.aclose()
+        assert backend.close_count == 1
+
+    asyncio.run(scenario())
 
 
 def test_application_pages_all_debug_events_within_inline_budget(tmp_path: Path) -> None:

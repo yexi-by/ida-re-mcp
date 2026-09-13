@@ -11,7 +11,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Literal, cast
@@ -366,6 +366,7 @@ class _DebugSession:
     workspace_lock: AsyncInterprocessFileLock
     worker_slot: AsyncInterprocessSlotLease
     owned_target: bool
+    request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     idle_task: asyncio.Task[None] | None = None
     close_task: asyncio.Task[None] | None = None
 
@@ -2418,134 +2419,157 @@ class Application:
                     "请使用 debug.establish 返回的 debug_session_id；已结束的会话不能继续使用。"
                 ),
             )
-        self._cancel_debug_idle(session)
+        close_required = False
         try:
-            if name == "debug.control":
-                typed = cast(DebugControlInput, request)
-                raw = await self._execute_debug(
-                    session,
-                    prepare_debug_control(session.context, typed),
-                    timeout_seconds=typed.timeout_ms / 1000 + 5,
-                )
-                adapted = adapt_debug_control(session.context, raw)
-                session.context = adapted.context
-                return adapted.output
-            if name == "debug.events":
-                typed = cast(DebugEventsInput, request)
-                raw = await self._execute_debug(
-                    session,
-                    prepare_debug_events(session.context, typed),
-                    timeout_seconds=typed.wait_ms / 1000 + 5,
-                )
-                adapted = adapt_debug_events(session.context, typed, raw)
-                session.context = adapted.context
-                return adapted.output
-            if name == "debug.inspect":
-                typed = cast(DebugInspectInput, request)
-                raw_results = [
-                    await self._execute_debug(session, command, timeout_seconds=35)
-                    for command in prepare_debug_inspect(session.context, typed)
-                ]
-                adapted = adapt_debug_inspect(session.context, typed, raw_results)
-                session.context = adapted.context
-                output = adapted.output
-                if _inline_model_size(output) > MAX_INLINE_RESULT_BYTES:
-                    if output.memory_bytes is not None:
-                        memory = bytes.fromhex(output.memory_bytes)
-                        artifact = await asyncio.to_thread(
-                            self.storage.artifacts.put_bytes,
-                            workspace_id=session.checkout.workspace_id,
-                            revision=session.checkout.revision,
-                            data=memory,
-                            media_type="application/octet-stream",
-                            name=f"debug-memory-{typed.stop_id}.bin",
-                        )
-                        output = output.model_copy(
-                            update={
-                                "memory_bytes": None,
-                                "memory_artifact": ArtifactReference(
-                                    uri=artifact.uri,
-                                    sha256=artifact.content_sha256,
-                                    size=artifact.size,
-                                    media_type=artifact.media_type,
-                                ),
-                            }
-                        )
-                    if _inline_model_size(output) > MAX_INLINE_RESULT_BYTES:
-                        snapshot_data = json.dumps(
-                            output.model_dump(mode="json"),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                            sort_keys=True,
-                        ).encode("utf-8")
-                        snapshot = await self._put_public_artifact(
-                            workspace_id=session.checkout.workspace_id,
-                            revision=session.checkout.revision,
-                            data=snapshot_data,
-                            media_type="application/vnd.ida-re.debug-snapshot+json",
-                            name=f"debug-snapshot-{typed.stop_id}.json",
-                        )
-                        output = type(output)(
-                            debug_session_id=output.debug_session_id,
-                            stop_id=output.stop_id,
-                            state="suspended",
-                            modules=[],
-                            threads=[],
-                            registers=[],
-                            stack=[],
-                            snapshot_artifact=ArtifactReference(
-                                uri=snapshot.uri,
-                                sha256=snapshot.content_sha256,
-                                size=snapshot.size,
-                                media_type=snapshot.media_type,
-                            ),
-                        )
-                return output
-            if name == "debug.breakpoints":
-                return await self._debug_replace_breakpoints(
-                    session,
-                    cast(DebugBreakpointsInput, request),
-                )
+            async with session.request_lock:
+                if (
+                    self._debug_sessions.get(session_id) is not session
+                    or session.close_task is not None
+                ):
+                    raise ToolExecutionError(
+                        BusinessErrorCode.DEBUG_STATE_CONFLICT,
+                        "调试会话已经结束或正在关闭。请重新调用 debug.establish 建立会话。",
+                    )
+                self._cancel_debug_idle(session)
+                try:
+                    output = await self._debug_session_tool(name, request, session)
+                    close_required = name == "debug.finish"
+                    return output
+                except WorkerProcessError:
+                    close_required = True
+                    raise
+                except DebugRequestCancelled as cancellation:
+                    close_required = isinstance(
+                        cancellation.failure, WorkerProcessError
+                    ) or session.context.state in {"exited", "detached", "lost", "failed"}
+                    raise
+                finally:
+                    if (
+                        not close_required
+                        and session.close_task is None
+                        and self._debug_sessions.get(session_id) is session
+                    ):
+                        self._arm_debug_idle(session)
+        finally:
+            if close_required:
+                await self._close_debug_session(session)
 
-            typed = cast(DebugFinishInput, request)
-            if typed.action == "terminate" and not session.owned_target:
-                raise ToolExecutionError(
-                    BusinessErrorCode.POLICY_DENIED,
-                    (
-                        "不能结束这个外部进程。terminate 只适用于由本服务启动的目标；"
-                        "外部进程请使用 detach。"
-                    ),
-                )
-            if typed.action == "detach" and session.owned_target:
-                raise ToolExecutionError(
-                    BusinessErrorCode.POLICY_DENIED,
-                    "这个进程由本服务启动，不能只断开连接。请使用 terminate 结束进程。",
-                )
+    async def _debug_session_tool(
+        self,
+        name: str,
+        request: StrictModel,
+        session: _DebugSession,
+    ) -> StrictModel:
+        if name == "debug.control":
+            typed = cast(DebugControlInput, request)
             raw = await self._execute_debug(
                 session,
-                prepare_debug_finish(session.context, typed),
+                prepare_debug_control(session.context, typed),
                 timeout_seconds=typed.timeout_ms / 1000 + 5,
             )
-            adapted = adapt_debug_finish(session.context, raw)
+            adapted = adapt_debug_control(session.context, raw)
             session.context = adapted.context
-            await self._close_debug_session(session)
             return adapted.output
-        except WorkerProcessError:
-            await self._close_debug_session(session)
-            raise
-        except DebugRequestCancelled as cancellation:
-            if isinstance(cancellation.failure, WorkerProcessError) or session.context.state in {
-                "exited",
-                "detached",
-                "lost",
-                "failed",
-            }:
-                await self._close_debug_session(session)
-            raise
-        finally:
-            if self._debug_sessions.get(session_id) is session:
-                self._arm_debug_idle(session)
+        if name == "debug.events":
+            typed = cast(DebugEventsInput, request)
+            raw = await self._execute_debug(
+                session,
+                prepare_debug_events(session.context, typed),
+                timeout_seconds=typed.wait_ms / 1000 + 5,
+            )
+            adapted = adapt_debug_events(session.context, typed, raw)
+            session.context = adapted.context
+            return adapted.output
+        if name == "debug.inspect":
+            typed = cast(DebugInspectInput, request)
+            raw_results = [
+                await self._execute_debug(session, command, timeout_seconds=35)
+                for command in prepare_debug_inspect(session.context, typed)
+            ]
+            adapted = adapt_debug_inspect(session.context, typed, raw_results)
+            session.context = adapted.context
+            output = adapted.output
+            if _inline_model_size(output) > MAX_INLINE_RESULT_BYTES:
+                if output.memory_bytes is not None:
+                    memory = bytes.fromhex(output.memory_bytes)
+                    artifact = await asyncio.to_thread(
+                        self.storage.artifacts.put_bytes,
+                        workspace_id=session.checkout.workspace_id,
+                        revision=session.checkout.revision,
+                        data=memory,
+                        media_type="application/octet-stream",
+                        name=f"debug-memory-{typed.stop_id}.bin",
+                    )
+                    output = output.model_copy(
+                        update={
+                            "memory_bytes": None,
+                            "memory_artifact": ArtifactReference(
+                                uri=artifact.uri,
+                                sha256=artifact.content_sha256,
+                                size=artifact.size,
+                                media_type=artifact.media_type,
+                            ),
+                        }
+                    )
+                if _inline_model_size(output) > MAX_INLINE_RESULT_BYTES:
+                    snapshot_data = json.dumps(
+                        output.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    snapshot = await self._put_public_artifact(
+                        workspace_id=session.checkout.workspace_id,
+                        revision=session.checkout.revision,
+                        data=snapshot_data,
+                        media_type="application/vnd.ida-re.debug-snapshot+json",
+                        name=f"debug-snapshot-{typed.stop_id}.json",
+                    )
+                    output = type(output)(
+                        debug_session_id=output.debug_session_id,
+                        stop_id=output.stop_id,
+                        state="suspended",
+                        modules=[],
+                        threads=[],
+                        registers=[],
+                        stack=[],
+                        snapshot_artifact=ArtifactReference(
+                            uri=snapshot.uri,
+                            sha256=snapshot.content_sha256,
+                            size=snapshot.size,
+                            media_type=snapshot.media_type,
+                        ),
+                    )
+            return output
+        if name == "debug.breakpoints":
+            return await self._debug_replace_breakpoints(
+                session,
+                cast(DebugBreakpointsInput, request),
+            )
+
+        typed = cast(DebugFinishInput, request)
+        if typed.action == "terminate" and not session.owned_target:
+            raise ToolExecutionError(
+                BusinessErrorCode.POLICY_DENIED,
+                (
+                    "不能结束这个外部进程。terminate 只适用于由本服务启动的目标；"
+                    "外部进程请使用 detach。"
+                ),
+            )
+        if typed.action == "detach" and session.owned_target:
+            raise ToolExecutionError(
+                BusinessErrorCode.POLICY_DENIED,
+                "这个进程由本服务启动，不能只断开连接。请使用 terminate 结束进程。",
+            )
+        raw = await self._execute_debug(
+            session,
+            prepare_debug_finish(session.context, typed),
+            timeout_seconds=typed.timeout_ms / 1000 + 5,
+        )
+        adapted = adapt_debug_finish(session.context, raw)
+        session.context = adapted.context
+        return adapted.output
 
     async def _debug_establish(
         self,
@@ -2840,26 +2864,27 @@ class Application:
             self._session_close_tasks.discard(task)
 
     async def _close_debug_session_once(self, session: _DebugSession) -> None:
-        session_id = session.context.debug_session_id
-        if self._debug_sessions.get(session_id) is session:
-            del self._debug_sessions[session_id]
-        self._cancel_debug_idle(session)
-        try:
-            await session.backend.close()
-        finally:
+        async with session.request_lock:
+            session_id = session.context.debug_session_id
+            if self._debug_sessions.get(session_id) is session:
+                del self._debug_sessions[session_id]
+            self._cancel_debug_idle(session)
             try:
-                await asyncio.to_thread(
-                    self.storage.workspaces.discard_checkout,
-                    session.checkout,
-                )
+                await session.backend.close()
             finally:
                 try:
-                    await session.workspace_lock.release()
+                    await asyncio.to_thread(
+                        self.storage.workspaces.discard_checkout,
+                        session.checkout,
+                    )
                 finally:
                     try:
-                        await session.worker_slot.release()
+                        await session.workspace_lock.release()
                     finally:
-                        self._debug_slots.release()
+                        try:
+                            await session.worker_slot.release()
+                        finally:
+                            self._debug_slots.release()
 
     def _cancel_debug_idle(self, session: _DebugSession) -> None:
         task = session.idle_task
