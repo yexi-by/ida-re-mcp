@@ -70,6 +70,36 @@ def test_may_backward_collects_every_cfg_reaching_definition(tmp_path: Path) -> 
     assert limit_hit is False
 
 
+@pytest.mark.parametrize("kind", ["reg", "stack", "global"])
+def test_may_tracks_remaining_bytes_after_partial_writes(tmp_path: Path, kind: str) -> None:
+    worker = _worker(tmp_path)
+    full = f"{kind}:0:8"
+    low = f"{kind}:0:4"
+    high = f"{kind}:4:4"
+    instructions = (
+        _instruction(0, 0, 0, definitions=frozenset({full})),
+        _instruction(1, 0, 1, definitions=frozenset({low})),
+        _instruction(2, 1, 0, uses=frozenset({full})),
+        _instruction(3, 1, 1, definitions=frozenset({high})),
+        _instruction(4, 1, 2, uses=frozenset({full})),
+    )
+    program = _MicroProgram(
+        instructions=instructions,
+        block_instructions={0: (0, 1), 1: (2, 3, 4)},
+        predecessors={0: (), 1: (0,)},
+        successors={0: (1,), 1: ()},
+    )
+
+    partial = worker._may_slice(program, [2], direction="backward", limit=10)
+    assert partial == ({0, 1, 2}, {(0, 2), (1, 2)}, {}, False)
+
+    overwritten = worker._may_slice(program, [4], direction="backward", limit=10)
+    assert overwritten == ({1, 3, 4}, {(1, 4), (3, 4)}, {}, False)
+
+    forward = worker._may_slice(program, [0], direction="forward", limit=10)
+    assert forward == ({0, 2}, {(0, 2)}, {}, False)
+
+
 def test_may_stops_at_unknown_call_and_reports_the_barrier(tmp_path: Path) -> None:
     worker = _worker(tmp_path)
     instructions = (

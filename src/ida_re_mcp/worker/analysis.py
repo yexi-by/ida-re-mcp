@@ -2047,11 +2047,11 @@ class AnalysisWorker(OwnerThreadBound):
     ) -> tuple[set[int], dict[tuple[int | None, _BarrierReason], None]]:
         definitions: set[int] = set()
         barriers: dict[tuple[int | None, _BarrierReason], None] = {}
-        pending = [(current.block, current.position)]
-        visited: set[tuple[int, int]] = set()
+        pending = [(current.block, current.position, location)]
+        visited: set[tuple[int, int, str]] = set()
         while pending:
-            block_id, before = pending.pop()
-            state = (block_id, before)
+            block_id, before, remaining = pending.pop()
+            state = (block_id, before, remaining)
             if state in visited:
                 continue
             visited.add(state)
@@ -2059,18 +2059,24 @@ class AnalysisWorker(OwnerThreadBound):
             indexes = program.block_instructions[block_id]
             for candidate_index in reversed(indexes[:before]):
                 candidate = program.instructions[candidate_index]
-                if self._barrier_blocks(candidate, location):
+                if self._barrier_blocks(candidate, remaining):
                     assert candidate.barrier is not None
                     barriers[(candidate_index, candidate.barrier)] = None
                     stopped = True
                     break
-                if self._definitions_overlap(candidate, location):
+                if self._definitions_overlap(candidate, remaining):
                     definitions.add(candidate_index)
+                    pending.extend(
+                        (block_id, candidate.position, fragment)
+                        for fragment in self._unwritten_locations(candidate, remaining)
+                    )
                     stopped = True
                     break
             if not stopped:
                 for predecessor in program.predecessors[block_id]:
-                    pending.append((predecessor, len(program.block_instructions[predecessor])))
+                    pending.append(
+                        (predecessor, len(program.block_instructions[predecessor]), remaining)
+                    )
         return definitions, barriers
 
     def _reachable_uses(
@@ -2081,11 +2087,11 @@ class AnalysisWorker(OwnerThreadBound):
     ) -> tuple[set[int], dict[tuple[int | None, _BarrierReason], None]]:
         uses: set[int] = set()
         barriers: dict[tuple[int | None, _BarrierReason], None] = {}
-        pending = [(current.block, current.position + 1)]
-        visited: set[tuple[int, int]] = set()
+        pending = [(current.block, current.position + 1, location)]
+        visited: set[tuple[int, int, str]] = set()
         while pending:
-            block_id, after = pending.pop()
-            state = (block_id, after)
+            block_id, after, remaining = pending.pop()
+            state = (block_id, after, remaining)
             if state in visited:
                 continue
             visited.add(state)
@@ -2093,20 +2099,54 @@ class AnalysisWorker(OwnerThreadBound):
             indexes = program.block_instructions[block_id]
             for candidate_index in indexes[after:]:
                 candidate = program.instructions[candidate_index]
-                if self._barrier_blocks(candidate, location):
+                if self._barrier_blocks(candidate, remaining):
                     assert candidate.barrier is not None
                     barriers[(candidate_index, candidate.barrier)] = None
                     stopped = True
                     break
-                if self._uses_overlap(candidate, location):
+                if self._uses_overlap(candidate, remaining):
                     uses.add(candidate_index)
-                if self._definitions_overlap(candidate, location):
+                if self._definitions_overlap(candidate, remaining):
+                    pending.extend(
+                        (block_id, candidate.position + 1, fragment)
+                        for fragment in self._unwritten_locations(candidate, remaining)
+                    )
                     stopped = True
                     break
             if not stopped:
                 for successor in program.successors[block_id]:
-                    pending.append((successor, 0))
+                    pending.append((successor, 0, remaining))
         return uses, barriers
+
+    @staticmethod
+    def _unwritten_locations(instruction: _MicroInstruction, location: str) -> tuple[str, ...]:
+        """部分写入只覆盖对应字节，继续追踪其余寄存器或内存范围。"""
+
+        if location in instruction.definitions:
+            return ()
+        parts = location.split(":")
+        if len(parts) != 3:
+            return (location,)
+        kind, start_text, size_text = parts
+        start = int(start_text)
+        fragments = [(start, start + int(size_text))]
+        for definition in sorted(instruction.definitions):
+            defined_parts = definition.split(":")
+            if len(defined_parts) != 3 or defined_parts[0] != kind:
+                continue
+            defined_start = int(defined_parts[1])
+            defined_end = defined_start + int(defined_parts[2])
+            remaining: list[tuple[int, int]] = []
+            for start, end in fragments:
+                if defined_end <= start or defined_start >= end:
+                    remaining.append((start, end))
+                    continue
+                if start < defined_start:
+                    remaining.append((start, defined_start))
+                if defined_end < end:
+                    remaining.append((defined_end, end))
+            fragments = remaining
+        return tuple(f"{kind}:{start}:{end - start}" for start, end in fragments)
 
     def _microcode_program(self, api: IdaModules, mba: object) -> _MicroProgram:
         mba.build_graph()
