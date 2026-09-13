@@ -426,27 +426,39 @@ class MutationWorker(OwnerThreadBound):
                     )
                 continue
             assert symbol.type is not None
-            end_ea = ea + bundle.type_ref_size(symbol.type)
-            if end_ea > int(segment.end_ea):
+            self._validate_il2cpp_data_range(api, symbol, ea, bundle.type_ref_size(symbol.type))
+
+    @staticmethod
+    def _validate_il2cpp_data_range(
+        api: IdaModules,
+        symbol: SymbolRecord,
+        ea: int,
+        size: int,
+    ) -> None:
+        """按实际应用大小检查数据范围，避免保留类型扩展后覆盖已有代码。"""
+
+        segment = api.ida_segment.getseg(ea)
+        end_ea = ea + size
+        if segment is None or size <= 0 or end_ea > int(segment.end_ea):
+            raise WorkerError(
+                "address_unmapped",
+                "IL2CPP data symbol 范围超出所在 IDB segment",
+                details={"symbol_id": symbol.id, "rva": symbol.rva},
+            )
+        cursor = ea
+        while cursor < end_ea:
+            if api.ida_funcs.get_func(cursor) is not None or api.ida_bytes.is_code(
+                api.ida_bytes.get_flags(cursor)
+            ):
                 raise WorkerError(
-                    "address_unmapped",
-                    "IL2CPP data symbol 范围超出所在 IDB segment",
+                    "address_kind_mismatch",
+                    "IL2CPP data symbol 不得覆盖函数或已分析代码",
                     details={"symbol_id": symbol.id, "rva": symbol.rva},
                 )
-            cursor = ea
-            while cursor < end_ea:
-                if api.ida_funcs.get_func(cursor) is not None or api.ida_bytes.is_code(
-                    api.ida_bytes.get_flags(cursor)
-                ):
-                    raise WorkerError(
-                        "address_kind_mismatch",
-                        "IL2CPP data symbol 不得覆盖函数或已分析代码",
-                        details={"symbol_id": symbol.id, "rva": symbol.rva},
-                    )
-                next_head = int(api.ida_bytes.next_head(cursor, end_ea))
-                if next_head <= cursor or next_head >= end_ea:
-                    break
-                cursor = next_head
+            next_head = int(api.ida_bytes.next_head(cursor, end_ea))
+            if next_head <= cursor or next_head >= end_ea:
+                break
+            cursor = next_head
 
     def _apply_il2cpp(
         self,
@@ -542,6 +554,7 @@ class MutationWorker(OwnerThreadBound):
                     typed += 1
             elif symbol.type is not None:
                 symbol_type = self._type_ref(api, symbol.type, type_names, pointer_width)
+                self._validate_il2cpp_data_range(api, symbol, ea, int(symbol_type.get_size()))
                 if not api.ida_typeinf.apply_tinfo(ea, symbol_type, api.ida_typeinf.TINFO_DEFINITE):
                     raise WorkerError(
                         "mutation_rejected",

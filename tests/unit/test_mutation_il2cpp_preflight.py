@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Literal, cast
 
@@ -16,6 +16,7 @@ from ida_re_mcp.il2cpp.models import (
     ManifestRecord,
     MetadataBinding,
     MethodRecord,
+    NamedTypeRef,
     NativeBinding,
     PrimitiveTypeRef,
     StructLayout,
@@ -46,6 +47,10 @@ class _FakeSegmentInfo:
 
 class _FakeName:
     @staticmethod
+    def get_name(_ea: int) -> str:
+        return "Actor_Data"
+
+    @staticmethod
     def is_valid_typename(_name: str) -> bool:
         return True
 
@@ -55,15 +60,23 @@ class _FakeName:
 
 
 class _FakeTinfo:
-    @staticmethod
-    def get_named_type(_til: object, _name: str) -> bool:
-        return False
+    def __init__(self, kept_size: int | None = None) -> None:
+        self._kept_size = kept_size
+
+    def get_named_type(self, _til: object, _name: str) -> bool:
+        return self._kept_size is not None
+
+    def get_size(self) -> int:
+        assert self._kept_size is not None
+        return self._kept_size
 
 
 class _FakeTypeinf:
-    @staticmethod
-    def tinfo_t() -> _FakeTinfo:
-        return _FakeTinfo()
+    def __init__(self, kept_size: int | None = None) -> None:
+        self._kept_size = kept_size
+
+    def tinfo_t(self) -> _FakeTinfo:
+        return _FakeTinfo(self._kept_size)
 
     @staticmethod
     def get_idati() -> object:
@@ -100,6 +113,10 @@ class _FakeBytes:
     def get_flags(ea: int) -> int:
         return ea
 
+    @staticmethod
+    def has_user_name(_flags: int) -> bool:
+        return True
+
     def is_code(self, flags: int) -> bool:
         return flags in self._code_addresses
 
@@ -113,6 +130,11 @@ class _FakeBytes:
 class _TestMutationWorker(MutationWorker):
     def preflight_il2cpp(self, api: IdaModules, bundle: Bundle) -> None:
         self._preflight_il2cpp(api, bundle, {})
+
+    def apply_kept_il2cpp(self, api: IdaModules, bundle: Bundle) -> dict[str, object]:
+        resolutions = {_TYPE_ID: "keep"}
+        self._preflight_il2cpp(api, bundle, resolutions)
+        return self._apply_il2cpp(api, bundle, resolutions)
 
 
 def _bundle(symbol_kind: Literal["function", "data"]) -> Bundle:
@@ -195,12 +217,13 @@ def _api(
     function: _FakeFunction | None,
     code_addresses: frozenset[int] = frozenset(),
     segment_end: int = 0x140005000,
+    kept_size: int | None = None,
 ) -> IdaModules:
     return cast(
         IdaModules,
         SimpleNamespace(
             ida_name=_FakeName(),
-            ida_typeinf=_FakeTypeinf(),
+            ida_typeinf=_FakeTypeinf(kept_size),
             ida_nalt=_FakeNalt(),
             ida_segment=_FakeSegment(segment_end),
             ida_funcs=_FakeFuncs(function),
@@ -241,6 +264,27 @@ def test_data_symbol_rejects_function_membership_and_code() -> None:
             _api(function=None, segment_end=0x140001004),
             bundle,
         )
+
+
+@pytest.mark.parametrize("crosses_segment", [False, True])
+def test_kept_type_checks_its_actual_size_before_applying_data(crosses_segment: bool) -> None:
+    worker = _TestMutationWorker()
+    source = _bundle("data")
+    symbol = source.symbols[0].model_copy(
+        update={"type": NamedTypeRef(kind="named", type_id=_TYPE_ID)}
+    )
+    bundle = replace(source, symbols=(symbol,))
+    api = _api(
+        function=None,
+        code_addresses=frozenset() if crosses_segment else frozenset({0x140001008}),
+        segment_end=0x140001008 if crosses_segment else 0x140005000,
+        kept_size=16,
+    )
+
+    with pytest.raises(WorkerError) as raised:
+        worker.apply_kept_il2cpp(api, bundle)
+
+    assert raised.value.code == ("address_unmapped" if crosses_segment else "address_kind_mismatch")
 
 
 def test_different_type_ids_cannot_share_an_ida_type_name_across_images() -> None:
