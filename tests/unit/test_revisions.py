@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 from pydantic import JsonValue
 
+import ida_re_mcp.supervisor._fs as filesystem
 from ida_re_mcp.supervisor import (
     ColdValidationReceipt,
     ImageIdentity,
@@ -617,6 +618,38 @@ def test_manifest_commit_failure_discards_candidate_and_preserves_head(
     assert registry.get_revision(workspace_id, base.revision).database_path.read_bytes() == b"base"
     assert source.read_bytes() == b"sample bytes"
     assert not staging.path.exists()
+
+
+def test_manifest_sync_failure_preserves_already_referenced_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, workspace_id, _source = _new_registry(tmp_path)
+    base = _publish(registry, workspace_id, None, b"base")
+    staging = registry.begin_staging(workspace_id, expected_revision=base.revision)
+    staging.database_path.write_bytes(b"candidate")
+    receipt = ColdValidationReceipt.create(
+        validator="cold.worker",
+        component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
+    )
+    sync_directory = filesystem._fsync_directory  # pyright: ignore[reportPrivateUsage]
+
+    def fail_workspace_sync(path: Path) -> None:
+        if path == registry.root / workspace_id:
+            raise OSError("injected post-replace sync failure")
+        sync_directory(path)
+
+    monkeypatch.setattr(filesystem, "_fsync_directory", fail_workspace_sync)
+
+    with pytest.raises(OSError, match="post-replace"):
+        registry.publish_staging(staging, receipt=receipt)
+
+    reopened = WorkspaceRegistry(registry.root, checkout_root=registry.checkout_root)
+    assert reopened.get(workspace_id).current_revision == staging.candidate_revision
+    published = reopened.get_revision(workspace_id, staging.candidate_revision)
+    assert published.database_path.read_bytes() == b"candidate"
+    assert reopened.get_revision(workspace_id, base.revision).database_path.read_bytes() == b"base"
 
 
 def test_retention_keeps_current_three_history_and_pinned(tmp_path: Path) -> None:

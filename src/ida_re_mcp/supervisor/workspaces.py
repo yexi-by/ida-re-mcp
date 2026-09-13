@@ -621,7 +621,7 @@ class WorkspaceRegistry:
         operation_id: str | None = None,
         operation_result: Mapping[str, JsonValue] | None = None,
     ) -> RevisionSnapshot:
-        """复核冷验证摘要并 CAS 发布; 失败时保留旧 HEAD。"""
+        """复核冷验证摘要并 CAS 发布；失败清理以已写入的 manifest 为准。"""
 
         try:
             return self._publish_staging_once(
@@ -658,8 +658,6 @@ class WorkspaceRegistry:
         ):
             raise StagingIntegrityError("staging 路径与 workspace 身份不一致")
         lock = self._lock_for(workspace_id)
-        moved_target: Path | None = None
-        committed = False
         with lock:
             manifest = self._read_workspace_manifest(workspace_id)
             self._check_revision_cas(manifest, staging.expected_revision)
@@ -702,7 +700,6 @@ class WorkspaceRegistry:
             target.parent.mkdir(exist_ok=True)
             try:
                 os.replace(staging.path, target)
-                moved_target = target
                 if _hash_payload(target) != expected_hashes:
                     raise StagingIntegrityError("revision 移动后内容摘要发生变化")
 
@@ -740,14 +737,6 @@ class WorkspaceRegistry:
                     image_identity=image_identity,
                 )
                 self._commit_manifest(workspace_id, next_manifest)
-                committed = True
-            except BaseException:
-                if not committed and moved_target is not None:
-                    _safe_remove_tree(
-                        moved_target,
-                        parent=self._workspace_path(workspace_id) / "revisions",
-                    )
-                raise
             finally:
                 with self._locks_guard:
                     self._active_staging.discard(staging.path)
@@ -757,7 +746,7 @@ class WorkspaceRegistry:
             return published
 
     def _discard_failed_staging(self, staging: RevisionStaging) -> None:
-        """只清理尚未成为 HEAD 的候选内容。"""
+        """依据持久化 manifest 清理未提交的候选，保留已被引用的 revision。"""
 
         workspace_id = validate_identifier(staging.workspace_id, field="workspace_id")
         lock = self._lock_for(workspace_id)
@@ -769,7 +758,7 @@ class WorkspaceRegistry:
                     parent=self._workspace_path(workspace_id) / ".staging",
                 )
             target = self._revision_path(workspace_id, staging.candidate_revision)
-            if target.exists() and manifest.current_revision != staging.candidate_revision:
+            if target.exists() and staging.candidate_revision not in manifest.revision_ids:
                 _safe_remove_tree(
                     target,
                     parent=self._workspace_path(workspace_id) / "revisions",
